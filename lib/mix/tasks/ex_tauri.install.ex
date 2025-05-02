@@ -3,6 +3,7 @@ defmodule Mix.Tasks.ExTauri.Install do
   Installs Tauri dependency
 
     $ mix tauri.install
+
   By default, it installs #{ExTauri.latest_version()} but you
   can configure it in your config files, such as:
 

@@ -1,5 +1,5 @@
 defmodule ExTauri do
-  @latest_version "1.4.0"
+  @latest_version "2.5.0"
 
   use Application
   require Logger
@@ -41,7 +41,9 @@ defmodule ExTauri do
       stderr_to_stdout: true
     ]
 
-    System.cmd("cargo", ["install", "tauri-cli@#{version}", "--root", "."], opts)
+    if System.find_executable(cargo_tauri_path()) == nil do
+      System.cmd("cargo", ["install", "tauri-cli@#{version}", "--root", "."], opts)
+    end
 
     args =
       [
@@ -50,9 +52,10 @@ defmodule ExTauri do
         app_name |> String.replace("\s", "") |> Macro.underscore(),
         "--window-title",
         window_title,
-        "--dev-path",
+        "--force",
+        "--dev-url",
         "#{scheme}://#{host}:#{port}",
-        "--dist-dir",
+        "--frontend-dist",
         "#{scheme}://#{host}:#{port}",
         "--directory",
         File.cwd!(),
@@ -69,14 +72,9 @@ defmodule ExTauri do
       stderr_to_stdout: true
     ]
 
-    res =
-      Path.join([installation_path, "bin", "cargo-tauri"])
-      |> System.cmd(args, opts)
-      |> elem(1)
-
-    case res do
-      0 -> :ok
-      _ -> raise "tauri unable to install. exited with status #{res}"
+    case System.cmd(cargo_tauri_path(), args, opts) do
+      {_, 0} -> :ok
+      {_, status} -> Mix.raise("tauri unable to install. exited with status #{status}")
     end
 
     # Override Cargo.toml to use app_name and set proper crates so they are not dependent on folders
@@ -85,7 +83,7 @@ defmodule ExTauri do
 
     # Override main.rs to set proper startup sequence
     path = Path.join([File.cwd!(), "src-tauri", "src", "main.rs"])
-    File.write!(path, main_src(host, port))
+    File.write!(path, main_src())
 
     # TODO remove this when possible, for some reason it's failing at the moment
     File.cp!(
@@ -99,19 +97,13 @@ defmodule ExTauri do
     |> Jason.decode!()
     |> then(fn content ->
       content
-      |> put_in(["package", "productName"], app_name)
-      |> put_in(["tauri", "bundle", "externalBin"], ["../burrito_out/desktop"])
+      |> put_in(["productName"], app_name)
+      |> put_in(["bundle", "externalBin"], ["../burrito_out/desktop"])
       |> put_in(
-        ["tauri", "bundle", "identifier"],
+        ["identifier"],
         "you.app.#{app_name |> String.replace("\s", "") |> Macro.underscore() |> String.replace("_", "-")}"
       )
-      |> put_in(["tauri", "allowlist"], %{
-        shell: %{
-          sidecar: true,
-          scope: [%{name: "../burrito_out/desktop", sidecar: true, args: ["start"]}]
-        }
-      })
-      |> put_in(["tauri", "windows"], [
+      |> put_in(["app", "windows"], [
         %{
           title: window_title,
           fullscreen: fullscreen,
@@ -123,6 +115,34 @@ defmodule ExTauri do
     end)
     |> Jason.encode!(pretty: true)
     |> then(&File.write!(Path.join([File.cwd!(), "src-tauri", "tauri.conf.json"]), &1))
+
+    # Add side car capabilities to capabilities/default.json
+    Path.join([File.cwd!(), "src-tauri", "capabilities", "default.json"])
+    |> File.read!()
+    |> Jason.decode!()
+    |> then(fn content ->
+      content
+      |> update_in(["permissions"], fn permissions ->
+        permissions ++
+          [
+            %{
+              identifier: "shell:allow-execute",
+              allow: [
+                %{
+                  args: ["start"],
+                  name: "../burrito_out/desktop",
+                  sidecar: true
+                }
+              ]
+            }
+          ]
+      end)
+      |> update_in(["permissions"], &(&1 ++ ["shell:allow-execute"]))
+    end)
+    |> Jason.encode!(pretty: true)
+    |> then(
+      &File.write!(Path.join([File.cwd!(), "src-tauri", "capabilities", "default.json"]), &1)
+    )
   end
 
   @doc """
@@ -163,26 +183,35 @@ defmodule ExTauri do
     wrap()
 
     # Set proper environment variables for tauri
-    System.put_env("TAURI_SKIP_DEVSERVER_CHECK", "true")
+    System.put_env("TAURI_CLI_NO_DEV_SERVER_WAIT", "true")
 
     opts = [
+      cd: Path.join(File.cwd!(), "src-tauri"),
       into: IO.stream(:stdio, :line),
       stderr_to_stdout: true
     ]
 
-    {_, 0} =
-      [installation_path(), "bin", "cargo-tauri"]
-      |> Path.join()
-      |> System.cmd(args, opts)
+    System.cmd(cargo_tauri_path(), args, opts)
   end
 
   defp wrap() do
-    File.rm_rf!(Path.join([Path.expand("~"), "Library", "Application Support", ".burrito"]))
+    File.rm_rf!("burrito_out/")
+
+    case :os.type() do
+      {:win32, _} ->
+        File.rm_rf!(Path.join([Path.expand("~"), ".burrito"]))
+
+      {:unix, :darwin} ->
+        File.rm_rf!(Path.join([Path.expand("~"), "Library", "Application Support", ".burrito"]))
+
+      {:unix, :linux} ->
+        File.rm_rf!(Path.join([Path.expand("~"), "local", "share", ".burrito"]))
+    end
 
     get_in(Mix.Project.config(), [:releases, :desktop]) ||
       raise "expected a burrito release configured for the app :desktop in your mix.exs"
 
-    Mix.Task.run("release", ["desktop"])
+    Mix.Task.run("release", ["desktop", "--overwrite", "--quiet", "--force"])
 
     triplet =
       System.cmd("rustc", ["-Vv"])
@@ -198,6 +227,10 @@ defmodule ExTauri do
     :ok
   end
 
+  defp cargo_tauri_path() do
+    Path.join([installation_path(), "bin", "cargo-tauri"])
+  end
+
   defp cargo_toml(app_name) do
     app_name = app_name |> String.replace("\s", "") |> Macro.underscore()
 
@@ -211,12 +244,15 @@ defmodule ExTauri do
     description = ""
 
     [build-dependencies]
-    tauri-build = "1.4.0"
+    tauri-build = { version = "2.2.0", features = [] }
 
     [dependencies]
     serde_json = "1.0"
     serde = { version = "1.0", features = ["derive"] }
-    tauri = { version = "1.4.1",features = ["api-all"] }
+    tauri = { version = "2.5.1", features = [] }
+    log = { version = "0.4.27", features = ["serde"] }
+    tauri-plugin-log = { version = "2.4.0", features = ["colored"] }
+    tauri-plugin-shell = "2.2.1"
 
     [features]
     # this feature is used for production builds or when `devPath` points to the filesystem and the built-in dev server is disabled.
@@ -226,54 +262,33 @@ defmodule ExTauri do
     """
   end
 
-  defp main_src(host, port) do
+  defp main_src() do
     """
     // Prevents additional console window on Windows in release, DO NOT REMOVE!!
     #![cfg_attr(not(debug_assertions), windows_subsystem = "windows")]
     use tauri::api::process::{Command, CommandEvent};
 
     fn main() {
-        tauri::Builder::default()
-            .setup(|_app| {
-                start_server();
-                check_server_started();
+    tauri::Builder::default()
+            .setup(|app| {
+                let sidecar_command = app.shell().sidecar("desktop").unwrap().args(["start"]);
+                let (mut rx, mut _child) = sidecar_command.spawn().unwrap();
+
+                tauri::async_runtime::spawn(async move {
+                    while let Some(event) = rx.recv().await {
+                        if let CommandEvent::Stdout(line_bytes) = event {
+                            let line = String::from_utf8_lossy(&line_bytes);
+                            println!("{}", line);
+                        }
+                    }
+                });
+
                 Ok(())
             })
+            .plugin(tauri_plugin_shell::init())
             .run(tauri::generate_context!())
             .expect("error while running tauri application");
     }
-    fn start_server() {
-        tauri::async_runtime::spawn(async move {
-            let (mut rx, mut _child) = Command::new_sidecar("desktop")
-                .expect("failed to setup `desktop` sidecar")
-                .spawn()
-                .expect("Failed to spawn packaged node");
-
-            while let Some(event) = rx.recv().await {
-                if let CommandEvent::Stdout(line) = event {
-                    println!("{}", line);
-                }
-            }
-        });
-    }
-
-    fn check_server_started() {
-        let sleep_interval = std::time::Duration::from_millis(200);
-        let host = "#{host}".to_string();
-        let port = "#{port}".to_string();
-        let addr = format!("{}:{}", host, port);
-        println!(
-            "Waiting for your phoenix dev server to start on {}...",
-            addr
-        );
-        loop {
-            if std::net::TcpStream::connect(addr.clone()).is_ok() {
-               break;
-            }
-            std::thread::sleep(sleep_interval);
-        }
-    }
-
     """
   end
 end
